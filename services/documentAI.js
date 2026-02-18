@@ -288,6 +288,71 @@ function getProcessorIdByType(type) {
     }
 }
 
+/**
+ * Summarizes documents using the Summary Processor.
+ */
+async function batchSummarizeDocuments(files) {
+    if (!bucketName) {
+        throw new Error('GCS_BUCKET_NAME is not defined in .env');
+    }
+    const processorId = process.env.SUMMARIZER_PROCESSOR_ID;
+    if (!processorId) {
+        throw new Error('SUMMARIZER_PROCESSOR_ID is not defined in .env');
+    }
+
+    console.log(`Starting Batch Summarization with processor ${processorId}...`);
+
+    // 1. Upload files
+    const { gcsUris, batchId } = await uploadFilesToGCS(files);
+
+    // 2. Prepare Input/Output Config
+    const outputPrefix = `gs://${bucketName}/output/${batchId}/summary/`;
+    const inputDocuments = {
+        gcsDocuments: { documents: gcsUris }
+    };
+    const documentOutputConfig = {
+        gcsOutputConfig: { gcsUri: outputPrefix }
+    };
+
+    const name = `projects/${process.env.PROJECT_ID}/locations/${process.env.LOCATION}/processors/${processorId}`;
+    const request = {
+        name,
+        inputDocuments,
+        documentOutputConfig,
+    };
+
+    // 3. Execute Batch Process
+    console.log('Sending request to Document AI Summary Processor...');
+    const [operation] = await client.batchProcessDocuments(request);
+    await operation.promise();
+    console.log('Batch Summarization Completed.');
+
+    // 4. Download and Parse Results
+    const results = await downloadResults(outputPrefix);
+    const summaryResults = [];
+
+    for (const res of results) {
+        const document = res.document;
+
+        // Extract summary text (check entities first which is common for generative processors)
+        let summaryText = document.text;
+        if (document.entities && document.entities.length > 0) {
+            const entitySummaries = document.entities.map(e => e.mentionText || e.normalizedValue?.text).join('\n');
+            if (entitySummaries && entitySummaries.length > 0) {
+                summaryText = entitySummaries;
+            }
+        }
+
+        summaryResults.push({
+            file: res.fileName,
+            summary: summaryText
+        });
+    }
+
+    return summaryResults;
+}
+
 module.exports = {
-    batchProcessDocuments
+    batchProcessDocuments,
+    batchSummarizeDocuments
 };
