@@ -6,7 +6,7 @@ node_modules/
 
 # Google Cloud credentials
 key.json
-*.json
+
 
 # System files
 .DS_Store

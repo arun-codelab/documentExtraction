@@ -1,101 +1,269 @@
 const { DocumentProcessorServiceClient } = require('@google-cloud/documentai').v1;
+const { Storage } = require('@google-cloud/storage');
+const path = require('path');
+const fs = require('fs');
+const { v4: uuidv4 } = require('uuid');
 require('dotenv').config();
 
-// Initialize the client
+// Initialize clients
 const client = new DocumentProcessorServiceClient();
+const storage = new Storage();
+const bucketName = process.env.GCS_BUCKET_NAME;
 
 /**
- * Classifies the document to determine its type.
- * @param {Buffer} buffer - The file buffer.
- * @param {string} mimeType - The file mime type.
- * @returns {Promise<string|null>} - The determined document type (e.g., 'AADHAR', 'PAN', 'INVOICE') or null.
+ * Uploads files to Google Cloud Storage.
+ * @param {Array} files - Array of multer file objects.
+ * @returns {Promise<Array<string>>} - Array of GCS URIs.
  */
-async function classifyDocument(buffer, mimeType) {
-    const name = `projects/${process.env.PROJECT_ID}/locations/${process.env.LOCATION}/processors/${process.env.CLASSIFIER_PROCESSOR_ID}`;
+async function uploadFilesToGCS(files) {
+    const batchId = uuidv4();
+    const gcsUris = [];
+
+    console.log(`Uploading ${files.length} files to GCS bucket ${bucketName}...`);
+
+    for (const file of files) {
+        const fileName = `input/${batchId}/${file.originalname}`;
+        const fileBuffer = file.buffer;
+
+        await storage.bucket(bucketName).file(fileName).save(fileBuffer);
+
+        const gcsUri = `gs://${bucketName}/${fileName}`;
+        gcsUris.push({
+            gcsUri: gcsUri,
+            mimeType: file.mimetype
+        });
+        console.log(`Uploaded ${fileName}`);
+    }
+
+    return { gcsUris, batchId };
+}
+
+/**
+ * Classifies a single document content (helper for batch logic if needed locally, 
+ * but for batch processing we typically use the processor directly).
+ * 
+ * NOTE: For batch processing with different document types, 
+ * we ideally need a Classifier Processor to split/classify first, 
+ * OR we assume all uploaded files are of the same type?
+ * 
+ * The user requirement says: "take the response from the classifier based on the type... call independent processors".
+ * 
+ * Configuring Batch Process for Classification:
+ * We will send all files to the Classifier Processor first using batchProcessDocuments.
+ */
+async function batchProcessDocuments(files) {
+    if (!bucketName) {
+        throw new Error('GCS_BUCKET_NAME is not defined in .env');
+    }
+
+    // 1. Upload files to GCS
+    const { gcsUris, batchId } = await uploadFilesToGCS(files);
+
+    // 2. Prepare Input Config for Classifier
+    const inputDocuments = {
+        gcsDocuments: {
+            documents: gcsUris
+        }
+    };
+
+    const outputUriPrefix = `gs://${bucketName}/output/${batchId}/classification/`;
+    const documentOutputConfig = {
+        gcsOutputConfig: {
+            gcsUri: outputUriPrefix
+        }
+    };
+
+    // 3. Call Batch Process on Classifier
+    const classifierProcessorId = process.env.CLASSIFIER_PROCESSOR_ID;
+    const name = `projects/${process.env.PROJECT_ID}/locations/${process.env.LOCATION}/processors/${classifierProcessorId}`;
 
     const request = {
         name,
-        rawDocument: {
-            content: buffer.toString('base64'),
-            mimeType: mimeType,
-        },
+        inputDocuments,
+        documentOutputConfig,
     };
 
-    const [result] = await client.processDocument(request);
-    const { document } = result;
+    console.log('Starting Batch Classification...');
+    // Poll for completion
+    const [operation] = await client.batchProcessDocuments(request);
+    await operation.promise();
+    console.log('Batch Classification Completed.');
 
-    // Assuming the classifier returns entities where the type is the class
-    // or checks the entities/pages to find the classification.
-    // For standard classifiers, it often returns entities with confidence.
+    // 4. Download Results and Determine Next Steps
+    const classificationResults = await downloadResults(outputUriPrefix);
 
-    if (document.entities && document.entities.length > 0) {
-        // Return the type of the entity with the highest confidence
-        console.log(document.entities, 'document.entities');
-        const topEntity = document.entities.sort((a, b) => b.confidence - a.confidence)[0];
+    // 5. Route to specific processors based on classification
+    // This is complex because we prefer to do 1 batch call per processor type if possible,
+    // or we have to loop.
+    // Let's analyze the classification results.
 
-        console.log(`Classified as ${topEntity.type} with confidence ${topEntity.confidence}`);
+    const extractionResults = [];
 
-        if (topEntity.confidence >= 0.9) {
-            return topEntity.type;
+    // Group files by detected type to minimize batch calls
+    const filesByType = {};
+
+    for (const res of classificationResults) {
+        // Parse the classification from the document content
+        // Document AI Batch output is a JSON file representing the Document object
+        const document = res.document;
+        const sourceGcsUri = getSourceGcsUriFromDocument(document); // Need to track which file this is
+
+        let documentType = null;
+        if (document.entities && document.entities.length > 0) {
+            const topEntity = document.entities.sort((a, b) => b.confidence - a.confidence)[0];
+            if (topEntity.confidence >= 0.7) {
+                documentType = topEntity.type;
+            }
+        }
+
+        if (documentType) {
+            if (!filesByType[documentType]) {
+                filesByType[documentType] = [];
+            }
+            // We need to pass the original input GCS URI or the Output GCS URI?
+            // Usually we extract from the *original* file. 
+            // So we need to map back to the input GCS URI.
+            // But wait, the classification result *is* the document. 
+            // If we want to run extraction, we should run it on the *original* file mostly.
+            // Or we can run it on the *output* of the classifier if it hasn't modified the text/content.
+            // Let's use the original GCS URI for extraction to be safe.
+
+            // Note: The Document object in the JSON output usually contains the `shardInfo` or `text` but maybe not the original `gcsUri`.
+            // However, the filenames in output usually match input, or we can track by order?
+            // Actually, for simplicity, since we have the list of `gcsUris` (Input), we can try to map them.
+            // But a robust way is to re-upload or just use the same input URI if we can identify it.
+
+            // Let's just push the *original* object from `gcsUris` that matches.
+            // Currently, matching output JSON to input file can be tricky without parsing the filename in the JSON output path.
+            // The JSON output filename is usually `input_filename-0.json`.
+
+            const originalFileName = path.basename(res.fileName).replace('-0.json', '');
+            // Find original GCS URI matching this name
+            const originalInput = gcsUris.find(u => u.gcsUri.endsWith(originalFileName));
+
+            if (originalInput) {
+                filesByType[documentType].push(originalInput);
+            }
         } else {
-            console.log(`Confidence score ${topEntity.confidence} is below threshold 0.7`);
-            return null;
+            extractionResults.push({
+                file: res.fileName,
+                error: 'Could not classify document or confidence too low.'
+            });
         }
     }
 
+    // 6. Execute Batch Extraction for each type
+    for (const [type, files] of Object.entries(filesByType)) {
+        const processorId = getProcessorIdByType(type);
+        if (processorId) {
+            console.log(`Starting Batch Extraction for ${type} (${files.length} files)...`);
+            const typeBatchId = uuidv4();
+            const typeOutputPrefix = `gs://${bucketName}/output/${batchId}/extraction/${type}/`;
+
+            const typeInputRequest = {
+                name: `projects/${process.env.PROJECT_ID}/locations/${process.env.LOCATION}/processors/${processorId}`,
+                inputDocuments: {
+                    gcsDocuments: {
+                        documents: files
+                    }
+                },
+                documentOutputConfig: {
+                    gcsOutputConfig: {
+                        gcsUri: typeOutputPrefix
+                    }
+                }
+            };
+
+            const [typeOp] = await client.batchProcessDocuments(typeInputRequest);
+            await typeOp.promise();
+
+            const typeResults = await downloadResults(typeOutputPrefix);
+
+            // Process results into final format
+            for (const tRes of typeResults) {
+                const extractedData = {};
+                if (tRes.document.entities) {
+                    tRes.document.entities.forEach(entity => {
+                        extractedData[entity.type] = entity.mentionText || entity.normalizedValue?.text;
+                    });
+                }
+                extractionResults.push({
+                    type: type,
+                    data: extractedData,
+                    sourceFile: tRes.fileName // approximation
+                });
+            }
+
+        } else {
+            console.log(`No processor found for type ${type}`);
+        }
+    }
+
+    // 7. Cleanup (Optional: logic to delete GCS files)
+    // await storage.bucket(bucketName).deleteFiles({ prefix: `input/${batchId}/` });
+    // await storage.bucket(bucketName).deleteFiles({ prefix: `output/${batchId}/` });
+
+    return extractionResults;
+}
+
+/**
+ * Downloads all JSON files from a GCS prefix and parses them.
+ */
+async function downloadResults(prefix) {
+    // Strip gs://bucketName/ if present to get the relative path within the bucket
+    let relativePrefix = prefix;
+    if (prefix.startsWith('gs://')) {
+        const parts = prefix.split(bucketName + '/');
+        if (parts.length > 1) {
+            relativePrefix = parts[1];
+        }
+    }
+
+    console.log(`Downloading results from prefix: ${relativePrefix}`);
+
+    try {
+        const [files] = await storage.bucket(bucketName).getFiles({ prefix: relativePrefix });
+        console.log(`Found ${files.length} files in GCS under prefix ${relativePrefix}`);
+
+        const results = [];
+
+        for (const file of files) {
+            if (file.name.endsWith('.json')) {
+                console.log(`Downloading file: ${file.name}`);
+                const [content] = await file.download();
+                const document = JSON.parse(content.toString());
+                results.push({
+                    fileName: file.name,
+                    document: document
+                });
+            }
+        }
+        return results;
+    } catch (error) {
+        console.error('Error in downloadResults:', error);
+        return [];
+    }
+}
+
+function getSourceGcsUriFromDocument(document) {
+    // Helper to find source if needed, often not directly in Document object unless in shardInfo
     return null;
 }
 
-/**
- * Extracts data from the document using the specified processor.
- * @param {string} processorId - The processor ID to use.
- * @param {Buffer} buffer - The file buffer.
- * @param {string} mimeType - The file mime type.
- * @returns {Promise<object>} - The extracted data.
- */
-async function extractDocument(processorId, buffer, mimeType) {
-    const name = `projects/${process.env.PROJECT_ID}/locations/${process.env.LOCATION}/processors/${processorId}`;
-
-    const request = {
-        name,
-        rawDocument: {
-            content: buffer.toString('base64'),
-            mimeType: mimeType,
-        },
-    };
-
-    const [result] = await client.processDocument(request);
-    const { document } = result;
-
-    console.log('Document extraction completed.');
-
-    // Extract key-value pairs or entities
-    const extractedData = {};
-    if (document.entities) {
-        document.entities.forEach(entity => {
-            extractedData[entity.type] = entity.mentionText || entity.normalizedValue?.text;
-        });
-    }
-
-    return extractedData;
-}
 
 /**
  * Gets the processor ID based on the document type.
- * @param {string} type - The document type.
- * @returns {string|null} - The processor ID.
  */
 function getProcessorIdByType(type) {
-    const normalizedType = type ? type : '';
-
+    const normalizedType = type ? type.toUpperCase() : '';
     switch (normalizedType) {
         case 'AADHAR':
-        case 'adharCard': // Handle potential variations
+        case 'ADHAR':
             return process.env.AADHAR_PROCESSOR_ID;
         case 'PAN':
-        case 'Pancard':
+        case 'PANCARD':
             return process.env.PAN_PROCESSOR_ID;
-        case 'invoice':
+        case 'INVOICE':
             return process.env.INVOICE_PROCESSOR_ID;
         default:
             return null;
@@ -103,7 +271,5 @@ function getProcessorIdByType(type) {
 }
 
 module.exports = {
-    classifyDocument,
-    extractDocument,
-    getProcessorIdByType
+    batchProcessDocuments
 };
