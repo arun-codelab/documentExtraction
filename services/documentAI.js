@@ -111,6 +111,7 @@ async function batchProcessDocuments(files) {
         let documentType = null;
         if (document.entities && document.entities.length > 0) {
             const topEntity = document.entities.sort((a, b) => b.confidence - a.confidence)[0];
+            console.log(`Top entity for file ${res.fileName}: ${topEntity.type} with confidence ${topEntity.confidence}`);
             if (topEntity.confidence >= 0.7) {
                 documentType = topEntity.type;
             }
@@ -137,12 +138,24 @@ async function batchProcessDocuments(files) {
             // Currently, matching output JSON to input file can be tricky without parsing the filename in the JSON output path.
             // The JSON output filename is usually `input_filename-0.json`.
 
-            const originalFileName = path.basename(res.fileName).replace('-0.json', '');
-            // Find original GCS URI matching this name
-            const originalInput = gcsUris.find(u => u.gcsUri.endsWith(originalFileName));
+            console.log(`Mapping output ${res.fileName} to input...`);
+            // Output filename format from Document AI typically appends -0.json (or -1.json etc for multiple shards)
+            // Example: a_01-0.json -> a_01
+            const outputBasename = path.basename(res.fileName).replace(/-[0-9]+\.json$/, '');
+            console.log(`Derived output basename: ${outputBasename}`);
+
+            // Find original GCS URI matching this basename (ignoring extension of input file)
+            const originalInput = gcsUris.find(u => {
+                const inputFileName = path.basename(u.gcsUri); // e.g., a_01.jpg
+                const inputBasename = inputFileName.replace(path.extname(inputFileName), ''); // e.g., a_01
+                return inputBasename === outputBasename;
+            });
 
             if (originalInput) {
+                console.log(`Found match: ${originalInput.gcsUri}`);
                 filesByType[documentType].push(originalInput);
+            } else {
+                console.log(`No input match found for ${outputBasename} in ${JSON.stringify(gcsUris.map(u => u.gcsUri))}`);
             }
         } else {
             extractionResults.push({
@@ -154,9 +167,16 @@ async function batchProcessDocuments(files) {
 
     // 6. Execute Batch Extraction for each type
     for (const [type, files] of Object.entries(filesByType)) {
+        console.log(`Processing files for type: ${type}`);
         const processorId = getProcessorIdByType(type);
+        console.log(`Processor ID for type ${type}: ${processorId}`);
         if (processorId) {
             console.log(`Starting Batch Extraction for ${type} (${files.length} files)...`);
+
+            if (files.length === 0) {
+                console.log(`Skipping batch extraction for ${type} as there are no matching input files.`);
+                continue;
+            }
             const typeBatchId = uuidv4();
             const typeOutputPrefix = `gs://${bucketName}/output/${batchId}/extraction/${type}/`;
 
@@ -255,15 +275,13 @@ function getSourceGcsUriFromDocument(document) {
  * Gets the processor ID based on the document type.
  */
 function getProcessorIdByType(type) {
-    const normalizedType = type ? type.toUpperCase() : '';
+    const normalizedType = type ? type : '';
     switch (normalizedType) {
-        case 'AADHAR':
-        case 'ADHAR':
+        case 'adharCard': // Handle potential variations
             return process.env.AADHAR_PROCESSOR_ID;
-        case 'PAN':
-        case 'PANCARD':
+        case 'Pancard':
             return process.env.PAN_PROCESSOR_ID;
-        case 'INVOICE':
+        case 'invoice':
             return process.env.INVOICE_PROCESSOR_ID;
         default:
             return null;
