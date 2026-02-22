@@ -58,7 +58,7 @@ async function batchProcessDocuments(files) {
 
     // 1. Upload files to GCS
     const { gcsUris, batchId } = await uploadFilesToGCS(files);
-
+    console.log(gcsUris, 'gcsUris------------');
     // 2. Prepare Input Config for Classifier
     const inputDocuments = {
         gcsDocuments: {
@@ -164,7 +164,7 @@ async function batchProcessDocuments(files) {
             });
         }
     }
-
+    console.log(filesByType, 'fileByType')
     // 6. Execute Batch Extraction for each type
     for (const [type, files] of Object.entries(filesByType)) {
         console.log(`Processing files for type: ${type}`);
@@ -198,11 +198,12 @@ async function batchProcessDocuments(files) {
             await typeOp.promise();
 
             const typeResults = await downloadResults(typeOutputPrefix);
-
+            console.log(typeResults, 'typeResults')
             // Process results into final format
             for (const tRes of typeResults) {
                 const extractedData = {};
                 if (tRes.document.entities) {
+                    console.log(tRes.document.entities, 'entities')
                     tRes.document.entities.forEach(entity => {
                         extractedData[entity.type] = entity.mentionText || entity.normalizedValue?.text;
                     });
@@ -354,5 +355,6 @@ async function batchSummarizeDocuments(files) {
 
 module.exports = {
     batchProcessDocuments,
-    batchSummarizeDocuments
+    batchSummarizeDocuments,
+    uploadFilesToGCS
 };
